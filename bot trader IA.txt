@@ -1,0 +1,125 @@
+# streamlit_app.py
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import requests
+from datetime import datetime
+import streamlit as st
+
+# Função para calcular o RSI manualmente
+def calcular_rsi(series, period=14):
+    delta = series.diff()
+    ganho = delta.where(delta > 0, 0)
+    perda = -delta.where(delta < 0, 0)
+    media_ganho = ganho.rolling(window=period).mean()
+    media_perda = perda.rolling(window=period).mean()
+    rs = media_ganho / media_perda
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+# Função para obter e processar dados
+def obter_dados(ativo_id):
+    url = f"https://api.coingecko.com/api/v3/coins/{ativo_id}/market_chart"
+    params = {'vs_currency': 'usd', 'days': '90'}
+    response = requests.get(url, params=params)
+    if response.status_code == 200 and 'prices' in response.json():
+        data = response.json()['prices']
+    else:
+        return None
+
+    prices = pd.DataFrame(data, columns=['Timestamp', 'Close'])
+    prices['Date'] = pd.to_datetime(prices['Timestamp'], unit='ms')
+    prices.set_index('Date', inplace=True)
+    df = prices[['Close']]
+    df['Volume'] = df['Close'].rolling(5).std() * 100
+    df['RSI'] = calcular_rsi(df['Close'], period=14)
+    df['MA9'] = df['Close'].rolling(window=9).mean()
+    df['MA25'] = df['Close'].rolling(window=25).mean()
+    df['MA50'] = df['Close'].rolling(window=50).mean()
+    df['Volume_Mean'] = df['Volume'].rolling(window=20).mean()
+
+    # Sinais com filtro de volume
+    df['Signal'] = ((df['RSI'] < 40) & (df['MA9'] > df['MA25']) & (df['Volume'] > df['Volume_Mean'])).astype(int)
+    df['Exit'] = ((df['RSI'] > 70) | (df['MA9'] < df['MA25'])).astype(int)
+
+    # Evitar sinais contínuos
+    df['Signal_Flag'] = (df['Signal'] == 1) & (df['Signal'].shift(1) == 0)
+    df['Exit_Flag'] = (df['Exit'] == 1) & (df['Exit'].shift(1) == 0)
+
+    return df
+
+# Função para simular trades
+def simular_trades(df):
+    trades = []
+    position = None
+    for i in range(len(df)):
+        if df['Signal_Flag'].iloc[i] and position is None:
+            entry_price = df['Close'].iloc[i]
+            entry_time = df.index[i]
+            position = {'entry_time': entry_time, 'entry_price': entry_price}
+        elif df['Exit_Flag'].iloc[i] and position:
+            exit_price = df['Close'].iloc[i]
+            exit_time = df.index[i]
+            profit = exit_price - position['entry_price']
+            profit_pct = (profit / position['entry_price']) * 100
+            trades.append({
+                'entry_time': position['entry_time'],
+                'entry_price': position['entry_price'],
+                'exit_time': exit_time,
+                'exit_price': exit_price,
+                'profit': profit,
+                'profit_pct': profit_pct
+            })
+            position = None
+    return pd.DataFrame(trades)
+
+# Interface Streamlit
+st.title("📊 IA Trader com RSI + Médias Móveis + Volume")
+
+# Seletor de ativo
+ativo_nome = st.selectbox("Escolha o Ativo", ['bitcoin', 'ethereum', 'solana', 'ripple'])
+df = obter_dados(ativo_nome)
+
+if df is not None:
+    st.subheader(f"Gráfico de {ativo_nome.capitalize()}/USDT")
+    fig, ax = plt.subplots(figsize=(14, 7))
+    ax.plot(df['Close'], label='Preço')
+    ax.plot(df['MA9'], label='MA9')
+    ax.plot(df['MA25'], label='MA25')
+    ax.plot(df['MA50'], label='MA50')
+
+    # Entradas
+    entradas = df[df['Signal_Flag'] == 1]
+    ax.scatter(entradas.index, entradas['Close'], label='Entrada', marker='^', color='g', s=100)
+    for idx, row in entradas.iterrows():
+        ax.annotate(f"${row['Close']:.2f}", (idx, row['Close']), textcoords="offset points", xytext=(0,10), ha='center')
+
+    # Saídas
+    saidas = df[df['Exit_Flag'] == 1]
+    ax.scatter(saidas.index, saidas['Close'], label='Saída', marker='v', color='r', s=100)
+    for idx, row in saidas.iterrows():
+        ax.annotate(f"${row['Close']:.2f}", (idx, row['Close']), textcoords="offset points", xytext=(0,-15), ha='center')
+
+    ax.legend()
+    ax.grid(True)
+    st.pyplot(fig)
+
+    # Gráfico de RSI
+    st.subheader("Indicador RSI")
+    fig_rsi, ax_rsi = plt.subplots(figsize=(14, 3))
+    ax_rsi.plot(df['RSI'], label='RSI', color='orange')
+    ax_rsi.axhline(70, linestyle='--', color='red', alpha=0.5)
+    ax_rsi.axhline(30, linestyle='--', color='green', alpha=0.5)
+    ax_rsi.set_title("RSI")
+    ax_rsi.grid(True)
+    st.pyplot(fig_rsi)
+
+    # Resultados dos trades
+    trades_df = simular_trades(df)
+    st.subheader("📈 Resultados dos Trades Simulados")
+    st.dataframe(trades_df)
+
+    st.metric("Lucro Total ($)", round(trades_df['profit'].sum(), 2))
+    st.metric("Lucro Percentual Médio (%)", round(trades_df['profit_pct'].mean(), 2))
+else:
+    st.error(f"Erro ao obter dados do ativo {ativo_nome}.")
